@@ -901,7 +901,7 @@ fovOptions={80,120,180}
 fovIndex=1
 laggerModePillRef=nil
 carryModePillRef=nil
-autoSwitchSpeedEnabled=false -- unused
+autoSwitchSpeedEnabled=false -- Auto Carry Speed toggle
 mobBtnTransparencyEnabled=false
 perButtonDragEnabled=true -- each mobile button drags independently
 antiKickEnabled=false
@@ -1222,6 +1222,10 @@ do
             updateTimerDisplay(remaining, false)
         end)
     end
+
+    -- Anti Ragdoll may clear the humanoid state before the watcher sees it.
+    -- Expose only the visual starter so the anti-ragdoll path can preserve the overhead cooldown.
+    _G._SpiritHubStartStealCooldownVisual = startRagdollTimer
 
     local function checkRagdoll()
         if ragdollCheckConn then return end
@@ -2550,6 +2554,24 @@ local function setupSpeedIndicator(char)
         end
     end)
 end
+-- Keep local overhead visuals alive if a ragdoll reset causes the game to replace/reparent the Head.
+_G._SpiritHubEnsureOverheadVisuals = function(char)
+    char = char or LP.Character
+    if not char then return end
+    local head = char:FindFirstChild("Head")
+    if not head then return end
+    local bb = head:FindFirstChild("K7SpeedBB")
+    if not bb or not bb.Parent then
+        pcall(setupSpeedIndicator, char)
+    else
+        pcall(function() bb.Enabled = true end)
+        pcall(applySpeedIndicatorTheme)
+    end
+    if _G._AdaptStyleCooldownVisuals then
+        pcall(_G._AdaptStyleCooldownVisuals, char)
+    end
+end
+
 local function getActiveMoveSpeed()
     if laggerCarryActive then return LAGGER_CARRY_SPEED
     elseif laggerModeEnabled then return LAGGER_SPEED
@@ -2822,6 +2844,193 @@ local function safeModeHoldingBrainrot()
     end
     return false
 end
+-- ============================================================
+-- AUTO CARRY SPEED
+-- Normal -> Carry when a pet/brainrot is picked up.
+-- Lagger Normal -> Lagger Carry while holding it, then restores.
+-- State lives in _G to avoid adding top-level local registers.
+-- ============================================================
+_G.AutoCarrySpeed = _G.AutoCarrySpeed or {}
+_G.AutoCarrySpeed.Enabled = autoSwitchSpeedEnabled == true
+_G.AutoCarrySpeed.carrying = false
+_G.AutoCarrySpeed.applied = false
+_G.AutoCarrySpeed.origin = nil
+_G.AutoCarrySpeed.lastSeen = 0
+_G.AutoCarrySpeed.watchUntil = 0
+_G.AutoCarrySpeed.lastCheck = 0
+
+_G.AutoCarrySpeed.RefreshVisuals = function()
+    if refreshSpeedModeLabel then pcall(refreshSpeedModeLabel) end
+    if mobBtnRefs then
+        if mobBtnRefs.carrySpeed then pcall(mobBtnRefs.carrySpeed, carrySpeedActive) end
+        if mobBtnRefs.lagger then pcall(mobBtnRefs.lagger, laggerModeEnabled or laggerCarryActive) end
+        if mobBtnRefs.laggerCarry then pcall(mobBtnRefs.laggerCarry, laggerCarryActive) end
+    end
+end
+
+_G.AutoCarrySpeed.Detect = function()
+    local char = LP.Character
+    if not char then return false end
+
+    -- Most game builds parent the stolen pet/brainrot as a Tool while carried.
+    for _,obj in ipairs(char:GetChildren()) do
+        local n = tostring(obj.Name):lower()
+        if obj:IsA("Tool") and (n:find("brainrot",1,true) or n:find("skibidi",1,true) or n:find("toilet",1,true) or n:find("pet",1,true) or n:find("animal",1,true)) then
+            return true
+        end
+        if obj:IsA("Model") and (n:find("brainrot",1,true) or n:find("pet",1,true) or n:find("animal",1,true)) then
+            return true
+        end
+    end
+
+    -- Carry/holding attributes and values are used by some versions of the game.
+    if not isStealing then
+        for _,container in ipairs({LP,char}) do
+            local ok,attrs = pcall(function() return container:GetAttributes() end)
+            if ok and type(attrs)=="table" then
+                for name,value in pairs(attrs) do
+                    local n=tostring(name):lower()
+                    if n:find("carry",1,true) or n:find("holding",1,true) or n:find("held",1,true) or n:find("brainrot",1,true) or n:find("pet",1,true) then
+                        if value==true then return true end
+                        if type(value)=="number" and value>0 then return true end
+                        if type(value)=="string" and value~="" and value~="0" and value:lower()~="false" and value:lower()~="none" then return true end
+                    end
+                end
+            end
+            for _,obj in ipairs(container:GetChildren()) do
+                local n=tostring(obj.Name):lower()
+                if n:find("carry",1,true) or n:find("holding",1,true) or n:find("held",1,true) or n:find("brainrot",1,true) or n:find("pet",1,true) then
+                    if obj:IsA("BoolValue") and obj.Value then return true end
+                    if obj:IsA("ObjectValue") and obj.Value~=nil then return true end
+                    if obj:IsA("StringValue") and obj.Value~="" and obj.Value:lower()~="none" then return true end
+                    if (obj:IsA("IntValue") or obj:IsA("NumberValue")) and obj.Value>0 then return true end
+                end
+            end
+        end
+        if safeModeHoldingBrainrot() then return true end
+    end
+
+    -- Some carried models are welded to a hand but remain outside Character.
+    for _,handName in ipairs({"RightHand","LeftHand","Right Arm","Left Arm"}) do
+        local hand=char:FindFirstChild(handName)
+        if hand and hand:IsA("BasePart") then
+            local ok,parts=pcall(function() return hand:GetConnectedParts(true) end)
+            if ok and parts then
+                for _,part in ipairs(parts) do
+                    if part~=hand and not part:IsDescendantOf(char) then
+                        local holder=part:FindFirstAncestorOfClass("Model")
+                        local n=tostring((holder and holder.Name) or part.Name):lower()
+                        if n:find("brainrot",1,true) or n:find("pet",1,true) or n:find("animal",1,true) or n:find("skibidi",1,true) or n:find("toilet",1,true) then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+_G.AutoCarrySpeed.ApplyCarry = function()
+    if not autoSwitchSpeedEnabled or _G.AutoCarrySpeed.applied then return end
+    if laggerModeEnabled then
+        _G.AutoCarrySpeed.origin = "lagger"
+        laggerModeEnabled = false
+        laggerCarryActive = true
+        carrySpeedActive = false
+        _G.AutoCarrySpeed.applied = true
+    elseif not carrySpeedActive and not laggerCarryActive then
+        _G.AutoCarrySpeed.origin = "normal"
+        carrySpeedActive = true
+        laggerModeEnabled = false
+        laggerCarryActive = false
+        _G.AutoCarrySpeed.applied = true
+    else
+        -- Already in a carry mode manually: don't take ownership of it.
+        _G.AutoCarrySpeed.origin = nil
+        _G.AutoCarrySpeed.applied = false
+    end
+    _G.AutoCarrySpeed.RefreshVisuals()
+end
+
+_G.AutoCarrySpeed.Restore = function()
+    if not _G.AutoCarrySpeed.applied then return end
+    if _G.AutoCarrySpeed.origin == "lagger" then
+        carrySpeedActive = false
+        laggerCarryActive = false
+        laggerModeEnabled = true
+    elseif _G.AutoCarrySpeed.origin == "normal" then
+        carrySpeedActive = false
+        laggerModeEnabled = false
+        laggerCarryActive = false
+    end
+    _G.AutoCarrySpeed.applied = false
+    _G.AutoCarrySpeed.origin = nil
+    _G.AutoCarrySpeed.RefreshVisuals()
+end
+
+_G.AutoCarrySpeed.CancelAuto = function()
+    -- Manual speed key/button takes control without forcing another mode.
+    _G.AutoCarrySpeed.applied = false
+    _G.AutoCarrySpeed.origin = nil
+end
+
+_G.AutoCarrySpeed.SetEnabled = function(on)
+    autoSwitchSpeedEnabled = on == true
+    _G.AutoCarrySpeed.Enabled = autoSwitchSpeedEnabled
+    if not autoSwitchSpeedEnabled then
+        _G.AutoCarrySpeed.Restore()
+        _G.AutoCarrySpeed.carrying = false
+        _G.AutoCarrySpeed.watchUntil = 0
+        return
+    end
+    local carrying = _G.AutoCarrySpeed.Detect()
+    _G.AutoCarrySpeed.carrying = carrying
+    if carrying then
+        _G.AutoCarrySpeed.lastSeen = tick()
+        _G.AutoCarrySpeed.ApplyCarry()
+    end
+end
+
+_G.AutoCarrySpeed.WatchPickup = function(seconds)
+    if not autoSwitchSpeedEnabled then return end
+    local now=tick()
+    _G.AutoCarrySpeed.watchUntil=math.max(_G.AutoCarrySpeed.watchUntil or 0, now+(tonumber(seconds) or 1.25))
+    _G.AutoCarrySpeed.lastSeen=now
+    _G.AutoCarrySpeed.carrying=true
+    -- Auto Steal only calls this after its grab trigger, so switch immediately.
+    _G.AutoCarrySpeed.ApplyCarry()
+end
+
+if _G.AutoCarrySpeed.conn then
+    pcall(function() _G.AutoCarrySpeed.conn:Disconnect() end)
+    _G.AutoCarrySpeed.conn=nil
+end
+_G.AutoCarrySpeed.conn = RunService.Heartbeat:Connect(function()
+    if not autoSwitchSpeedEnabled then return end
+    local now=tick()
+    if now-(_G.AutoCarrySpeed.lastCheck or 0)<0.08 then return end
+    _G.AutoCarrySpeed.lastCheck=now
+    local detected=_G.AutoCarrySpeed.Detect()
+    if detected then
+        _G.AutoCarrySpeed.lastSeen=now
+        if not _G.AutoCarrySpeed.carrying then
+            _G.AutoCarrySpeed.carrying=true
+            _G.AutoCarrySpeed.ApplyCarry()
+        end
+        return
+    end
+    if _G.AutoCarrySpeed.carrying then
+        -- Small debounce prevents one-frame detection gaps from flipping speed.
+        local protectedUntil=math.max(_G.AutoCarrySpeed.watchUntil or 0, (_G.AutoCarrySpeed.lastSeen or 0)+0.35)
+        if now>=protectedUntil then
+            _G.AutoCarrySpeed.carrying=false
+            _G.AutoCarrySpeed.watchUntil=0
+            _G.AutoCarrySpeed.Restore()
+        end
+    end
+end)
+
 local function safeModeIsLocked()
     if not safeModeEnabled then return false end
     return safeModeInDuelCountdown() or safeModeHoldingBrainrot()
@@ -5386,7 +5595,7 @@ saveConfig=function()
             infiniteJump=infJumpEnabled==true, infJumpMode=infJumpMode,
             medusaCounter=medusaCounterEnabled==true, batCounter=batCounterEnabled==true,
             carrySpeedActive=carrySpeedActive==true, laggerModeEnabled=laggerModeEnabled==true,
-            laggerCarryActive=laggerCarryActive==true,
+            laggerCarryActive=laggerCarryActive==true, autoCarrySpeed=autoSwitchSpeedEnabled==true,
             laggerSpeed=LAGGER_SPEED, laggerCarrySpeed=LAGGER_CARRY_SPEED,
             autoBat=autoBatEnabled==true, tpBat=tpBatEnabled==true, aimbotMode=aimbotMode,
 
@@ -5431,7 +5640,9 @@ saveConfig=function()
 end
 task.spawn(function() while task.wait(5) do saveConfig() end end)
 local function resetAllSettings()
-    NS=60;CS=30;LAGGER_SPEED=15;LAGGER_CARRY_SPEED=24.5;carrySpeedActive=false;laggerModeEnabled=false;laggerCarryActive=false
+    if _G.AutoCarrySpeed and _G.AutoCarrySpeed.CancelAuto then pcall(_G.AutoCarrySpeed.CancelAuto) end
+    NS=60;CS=30;LAGGER_SPEED=15;LAGGER_CARRY_SPEED=24.5;carrySpeedActive=false;laggerModeEnabled=false;laggerCarryActive=false;autoSwitchSpeedEnabled=false
+    if _G.AutoCarrySpeed then _G.AutoCarrySpeed.Enabled=false;_G.AutoCarrySpeed.carrying=false;_G.AutoCarrySpeed.watchUntil=0 end
     antiRagdollEnabled=false;AdaptK7Extras.antiRagdollMode="Splatter";AdaptK7Extras.hardHitEnabled=false;AdaptK7Extras.hardHitRadius=10;infJumpEnabled=false;infJumpMode="manual"
     antiFlingEnabled=true;AdaptK7Extras.antiDieEnabled=false;AdaptK7Extras.stretchedResEnabled=false;AdaptK7Extras.stretchValue=0.7;AdaptK7Extras.removeAccessories=false
     medusaCounterEnabled=false;batCounterEnabled=false;unwalkEnabled=false
@@ -5447,6 +5658,7 @@ local function resetAllSettings()
     if refreshSpeedModeLabel then refreshSpeedModeLabel() end
     if mobBtnRefs.carrySpeed then mobBtnRefs.carrySpeed(carrySpeedActive) end
     if mobBtnRefs.lagger then mobBtnRefs.lagger(laggerModeEnabled or laggerCarryActive) end
+    if setAutoCarrySpeedVisual then setAutoCarrySpeedVisual(false) end
     if mobBtnRefs.autoLeft then mobBtnRefs.autoLeft(false) end
     if mobBtnRefs.autoRight then mobBtnRefs.autoRight(false) end
     if mobBtnRefs.autoBat then mobBtnRefs.autoBat(false) end
@@ -5456,6 +5668,7 @@ local function resetAllSettings()
 end
 setInstaGrab,setInfJumpVisual,setAntiRagVisual,setMedusaVisual,setUnwalkVisual,setAntiLagVisual,setAutoSwingVisual=nil,nil,nil,nil,nil,nil,nil
 setAntiDieVisual,setAntiFlingVisual,setStretchRezVisual,setRemoveAccessoriesVisual=nil,nil,nil,nil
+setAutoCarrySpeedVisual=nil
 setHardHitVisual=nil;hardHitRangeBox=nil;semiRadiusBox=nil;semiHoldMinBox=nil;semiHoldMaxBox=nil
 setTranspVisual,setLockVisual,setMobVisual,setCircleBtnsVisual=nil,nil,nil,nil
 normalBox,carryBox,laggerBox,laggerCarryBox,radInput,autoTPHeightBox,durationBox=nil,nil,nil,nil,nil,nil,nil
@@ -5486,6 +5699,7 @@ refreshSpeedModeLabel=function()
     end
 end
 toggleCarryMode=function()
+    if _G.AutoCarrySpeed and _G.AutoCarrySpeed.CancelAuto then pcall(_G.AutoCarrySpeed.CancelAuto) end
     carrySpeedActive = not carrySpeedActive
     if carrySpeedActive then
         laggerModeEnabled = false
@@ -5496,6 +5710,7 @@ toggleCarryMode=function()
     if mobBtnRefs.lagger then mobBtnRefs.lagger(laggerModeEnabled or laggerCarryActive) end
 end
 toggleLaggerMode=function()
+    if _G.AutoCarrySpeed and _G.AutoCarrySpeed.CancelAuto then pcall(_G.AutoCarrySpeed.CancelAuto) end
     -- Single Lagger Mode control: alternate Lagger Carry <-> Lagger Normal.
     carrySpeedActive = false
     if laggerCarryActive then
@@ -5510,6 +5725,7 @@ toggleLaggerMode=function()
     if mobBtnRefs.lagger then mobBtnRefs.lagger(true) end
 end
 toggleLaggerCarryMode=function()
+    if _G.AutoCarrySpeed and _G.AutoCarrySpeed.CancelAuto then pcall(_G.AutoCarrySpeed.CancelAuto) end
     laggerCarryActive = not laggerCarryActive
     if laggerCarryActive then
         carrySpeedActive = false
@@ -5653,19 +5869,26 @@ startAntiRagdoll = function()
         local hum=char:FindFirstChildOfClass("Humanoid");local root=char:FindFirstChild("HumanoidRootPart")
         if not hum or hum.Health<=0 then return end
         local state=hum:GetState();local ragdolled=(state==Enum.HumanoidStateType.Physics or state==Enum.HumanoidStateType.Ragdoll or state==Enum.HumanoidStateType.FallingDown)
+        local endTime=LP:GetAttribute("RagdollEndTime");if endTime and (endTime-workspace:GetServerTimeNow())>0 then ragdolled=true end
         if AdaptK7Extras.antiRagdollMode=="No Splatter" then
-            if ragdolled then local now=tick();if now-(AdaptK7Extras.antiRagdollNoSplatterCooldown or 0)>0.15 then AdaptK7Extras.antiRagdollNoSplatterCooldown=now;AdaptK7Extras.forceNoSplatterReset() end end
+            if ragdolled then
+                if _G._SpiritHubStartStealCooldownVisual then pcall(_G._SpiritHubStartStealCooldownVisual) end
+                local now=tick();if now-(AdaptK7Extras.antiRagdollNoSplatterCooldown or 0)>0.15 then AdaptK7Extras.antiRagdollNoSplatterCooldown=now;AdaptK7Extras.forceNoSplatterReset() end
+                task.defer(function() task.wait(0.05);if _G._SpiritHubEnsureOverheadVisuals then pcall(_G._SpiritHubEnsureOverheadVisuals,LP.Character) end;if _G._SpiritHubRefreshPlayerEsp then pcall(_G._SpiritHubRefreshPlayerEsp) end end)
+            end
             return
         end
         if not root then return end
-        local endTime=LP:GetAttribute("RagdollEndTime");if endTime and (endTime-workspace:GetServerTimeNow())>0 then ragdolled=true end
         if ragdolled then
+            -- Start/preserve the overhead cooldown before clearing the ragdoll state.
+            if _G._SpiritHubStartStealCooldownVisual then pcall(_G._SpiritHubStartStealCooldownVisual) end
             pcall(function() LP:SetAttribute("RagdollEndTime",workspace:GetServerTimeNow()) end)
             for _,d in ipairs(char:GetDescendants()) do if d:IsA("BallSocketConstraint") or (d:IsA("Attachment") and d.Name:find("RagdollAttachment")) then d:Destroy() end end
             for _,obj in ipairs(char:GetDescendants()) do if obj:IsA("Motor6D") and obj.Enabled==false then obj.Enabled=true end end
             if hum.Health>0 then hum:ChangeState(Enum.HumanoidStateType.Running) end
             if workspace.CurrentCamera then workspace.CurrentCamera.CameraSubject=hum end
             root.Anchored=false;root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero
+            task.defer(function() task.wait(0.05);if _G._SpiritHubEnsureOverheadVisuals then pcall(_G._SpiritHubEnsureOverheadVisuals,LP.Character) end;if _G._SpiritHubRefreshPlayerEsp then pcall(_G._SpiritHubRefreshPlayerEsp) end end)
         end
     end)
 end
@@ -5681,6 +5904,11 @@ LP.CharacterAdded:Connect(function(char)
         stopAntiRagdoll()
         startAntiRagdoll()
     end
+    task.defer(function()
+        task.wait(0.1)
+        if _G._SpiritHubEnsureOverheadVisuals then pcall(_G._SpiritHubEnsureOverheadVisuals,char) end
+        if _G._SpiritHubRefreshPlayerEsp then pcall(_G._SpiritHubRefreshPlayerEsp) end
+    end)
 end)
 startUnwalk=function()
     local c=LP.Character;if not c then return end;local hum=c:FindFirstChildOfClass("Humanoid")
@@ -6429,6 +6657,10 @@ local function refreshAllEsp()
     for plr in pairs(_espObjects) do
         if not plr.Parent or plr == LP then clearEspFor(plr) end
     end
+end
+
+_G._SpiritHubRefreshPlayerEsp = function()
+    pcall(refreshAllEsp)
 end
 
 local function ensureEspHeartbeat()
@@ -7607,9 +7839,12 @@ local function buildGui()
     carryBox = makeInputRow("Carry Speed",CS,function(v) if v>0 and v<=500 then CS=v;saveConfig() end end)
     laggerBox = makeInputRow("Lagger Speed",LAGGER_SPEED,function(v) if v>0 and v<=500 then LAGGER_SPEED=v;saveConfig() end end)
     laggerCarryBox = makeInputRow("Lagger Carry",LAGGER_CARRY_SPEED,function(v) if v>0 and v<=500 then LAGGER_CARRY_SPEED=v;saveConfig() end end)
+    setAutoCarrySpeedVisual = makeToggleRow("Auto Carry Speed",autoSwitchSpeedEnabled,function(on)
+        if _G.AutoCarrySpeed and _G.AutoCarrySpeed.SetEnabled then pcall(_G.AutoCarrySpeed.SetEnabled,on) else autoSwitchSpeedEnabled=on==true end
+        saveConfig()
+    end)
 
-    -- Carry/Lagger GUI toggles removed by request.
-    -- These modes are controlled only by their buttons and keybinds.
+    -- Carry/Lagger manual modes are still controlled by their buttons/keybinds.
     modeValLbl = makeStatusRow("Current Mode","Normal")
     pcall(refreshSpeedModeLabel)
     makeGap(8)
@@ -8200,6 +8435,8 @@ local function loadConfigKeys()
     if cfg.carrySpeedActive~=nil then carrySpeedActive=cfg.carrySpeedActive end
     if cfg.laggerModeEnabled~=nil then laggerModeEnabled=cfg.laggerModeEnabled end
     if cfg.laggerCarryActive~=nil then laggerCarryActive=cfg.laggerCarryActive end
+    if cfg.autoCarrySpeed~=nil then autoSwitchSpeedEnabled=cfg.autoCarrySpeed==true end
+    if _G.AutoCarrySpeed then _G.AutoCarrySpeed.Enabled=autoSwitchSpeedEnabled end
     if cfg.infJumpMode then infJumpMode=cfg.infJumpMode end
     if cfg.fovValue then fovValue=cfg.fovValue;for idx,v in ipairs(fovOptions) do if v==fovValue then fovIndex=idx end end end
     if cfg.chromeImageVisible~=nil then _G._K7Duels_bgImageVisible=cfg.chromeImageVisible==true end
@@ -8225,6 +8462,8 @@ local function loadConfigState()
     if radInput then radInput.Text=tostring(Steal.StealRadius) end;if durationBox then durationBox.Text=tostring(Steal.StealDuration) end
     if laggerBox then laggerBox.Text=tostring(LAGGER_SPEED) end
     if laggerCarryBox then laggerCarryBox.Text=tostring(LAGGER_CARRY_SPEED) end
+    if setAutoCarrySpeedVisual then setAutoCarrySpeedVisual(autoSwitchSpeedEnabled) end
+    if _G.AutoCarrySpeed and _G.AutoCarrySpeed.SetEnabled then pcall(_G.AutoCarrySpeed.SetEnabled,autoSwitchSpeedEnabled) end
     if autoTPHeightBox then autoTPHeightBox.Text=tostring(autoTPHeight) end
     task.spawn(function()
         task.wait(0.15)
